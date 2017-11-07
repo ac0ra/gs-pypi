@@ -30,5 +30,16 @@ pip-log.txt
 
 tst
 
+# environment
+env
+venv
+
 #layman
 layman
+
+
+# VIM swap files
+*.swp
+
+# PyCharm components
+.idea

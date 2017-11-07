@@ -14,13 +14,136 @@
 import datetime
 import re
 import time
+import glob
+import os
+import requests
+import urllib
 
 import bs4
+import multiprocessing
+import tarfile
 
+from g_sorcery.fileutils import _call_parser, wget, load_remote_file
+from g_sorcery.compatibility import TemporaryDirectory
 from g_sorcery.db_layout import BSON_FILE_SUFFIX
 from g_sorcery.exceptions import DownloadingError
 from g_sorcery.g_collections import Package, serializable_elist
 from g_sorcery.package_db import DBGenerator, PackageDB
+
+def pypi_versions(name):
+    url = "https://pypi.python.org/pypi/{}/json".format(name)
+    versions = []
+    try:
+        releases = requests.get(url).json()["releases"]
+    except:
+        releases = []
+    for ver in releases:
+        versions.append(ver)
+    return versions
+
+
+def _call_parser(f_name, parser, open_file = True, open_mode = 'r'):
+    """
+    Call parser on a given file.
+
+    Args:
+        f_name: File name.
+        parser: Parser function.
+        open_file: Whether parser accepts a file descriptor.
+        open_mode: Open mode for a file.
+
+    Returns:
+        A dictionary with one entry. Key if a file name, content is
+    content returned by parser.
+    """
+    data = None
+    if isinstance(parser, basestring):
+        parser = getattr(PypiDBGenerator, parser)
+    if open_file:
+        with open(f_name, open_mode) as f:
+            data = parser(f)
+    else:
+        data = parser(f_name)
+    return {os.path.basename(f_name): data}
+
+
+def load_remote_file(uri, parser, open_file = True, open_mode = 'r', output = "", timeout = None):
+    """
+    Load files from an URI.
+
+    Args:
+        uri: URI.
+        parser: Parser that will be applied to downloaded files.
+        open_file: Whether parser accepts a file descriptor.
+        open_mode: Open mode for a file.
+        output: What output name should downloaded file have.
+        timeout: URI access timeout.
+    (it will be a key identifying data loaded from this file)
+
+    Returns:
+        Dictionary with a loaded data. Key is filename, content is data returned by parser.
+    """
+    download_dir = TemporaryDirectory()
+    loaded_data = {}
+    #if wget(uri, download_dir.name, output, timeout=timeout):
+    url = urllib.URLopener()
+    if not url.retrieve(uri,filename=download_dir.name+"/"+output):
+        raise DownloadingError("wget failed: " + uri)
+    for f_name in glob.glob(os.path.join(download_dir.name, "*")):
+        if tarfile.is_tarfile(f_name):
+            unpack_dir = TemporaryDirectory()
+            with tarfile.open(f_name) as f:
+                f.extractall(unpack_dir.name)
+            for uf_name in glob.glob(os.path.join(unpack_dir, "*")):
+                loaded_data.update(_call_parser(uf_name, parser,
+                                    open_file=open_file, open_mode=open_mode))
+            del unpack_dir
+        else:
+            name, extention = os.path.splitext(f_name)
+            if extention in [".xz", ".lzma"]:
+                if (os.system("xz -d " + f_name)):
+                    raise DownloadingError("xz failed: "
+                                + f_name + " from " + uri)
+                f_name = name
+            loaded_data.update(_call_parser(f_name, parser,
+                                open_file=open_file, open_mode=open_mode))
+    del download_dir
+    return loaded_data
+
+
+class Worker(multiprocessing.Process):
+    def __init__(self, task_queue, result_queue):
+        multiprocessing.Process.__init__(self)
+        self.task_queue = task_queue
+        self.result_queue = result_queue
+
+    def run(self):
+        proc_name = self.name
+        while True:
+            uri = self.task_queue.get()
+            if uri is None:
+                print( '%s: Exiting' % proc_name)
+                self.task_queue.task_done()
+                break
+            attempts = 0
+            while True:
+                    try:
+                        attempts += 1
+                        data = load_remote_file(**uri)
+                    except DownloadingError as error:
+                        print(str(error))
+                        if attempts < 100:
+                            continue
+                        elif attempts == 100:
+                            self.task_queue.task_done()
+                            break
+                    self.task_queue.task_done()
+                    self.result_queue.put(data)
+                    for n in data:
+                        print(n)
+                    break
+            #print(data)
+
 
 class PypiDBGenerator(DBGenerator):
     """
@@ -38,68 +161,145 @@ class PypiDBGenerator(DBGenerator):
                                               preferred_category_format=preferred_category_format)
         self.count = count
 
+    def generate_tree(self, pkg_db, common_config, config):
+        """
+        Generate package entries.
+
+        Args:
+            pkg_db: Package database.
+            common_config: Backend config.
+            config: Repository config.
+        """
+        ## MULTIPROCESSING
+        self.first = True
+        self.lock = multiprocessing.Lock()
+        self.task_queue = multiprocessing.JoinableQueue()
+        #self.task_queue = multiprocessing.Queue()
+        self.result_queue = multiprocessing.Queue()
+        self.nproc = multiprocessing.cpu_count() * 2
+        workers = [ Worker(self.task_queue, self.result_queue) for n in xrange(self.nproc)]
+        for w in workers:
+            w.start()
+        data = self.download_data(common_config, config)
+        for n in xrange(self.nproc):
+            self.task_queue.put(None)
+        self.process_data(pkg_db, data, common_config, config)
+
+    def download_data(self, common_config, config):
+        """
+        Obtain data for database generation.
+
+        Args:
+            common_config: Backend config.
+            config: Repository config.
+
+        Returns:
+            Downloaded data.
+        """
+        uries = self.get_download_uries(common_config, config)
+        uries = self.decode_download_uries(uries)
+        data = {}
+        for uri in uries:
+            self.process_uri(uri, data)
+        return data
+
+    def decode_download_uries(self, uries):
+        """
+        Convert URI list with incomplete and string entries
+        into list with complete dictionary entries.
+
+        Args:
+            uries: List of URIes.
+
+        Returns:
+            List of URIes with dictionary entries.
+        """
+        decoded = []
+        for uri in uries:
+            decuri = {}
+            if isinstance(uri, basestring):
+                decuri["uri"] = uri
+                decuri["parser"] = self.parse_data
+                decuri["open_file"] = True
+                decuri["open_mode"] = "r"
+            else:
+                decuri = uri
+                if not "parser" in decuri:
+                    decuri["parser"] = self.parse_data
+                if not "open_file" in decuri:
+                    decuri["open_file"] = True
+                if not "open_mode" in decuri:
+                    decuri["open_mode"] = "r"
+            decoded.append(decuri)
+        return decoded
+
     def get_download_uries(self, common_config, config):
         """
         Get URI of packages index.
         """
         self.repo_uri = config["repo_uri"]
-        return [{"uri": self.repo_uri + "pypi?%3Aaction=index", "output": "packages"}]
+        return [{"uri": self.repo_uri + "simple", "output": "packages"}]
 
     def parse_data(self, data_f):
         """
         Download and parse packages index. Then download and parse pages for all packages.
         """
-        soup = bs4.BeautifulSoup(data_f.read())
-        packages = soup.table
+        soup = bs4.BeautifulSoup(data_f, "lxml")
+        packages = soup.body
         data = {}
         data["index"] = {}
+        ## MULTIPROCESSING
+        task_queue = self.task_queue
+        result_queue = self.result_queue
 
         pkg_uries = []
 
         last = -1
         if self.count:
             last = self.count
-        for entry in packages.find_all("tr")[1:last]:
-            package, description = entry.find_all("td")
+        if packages is not None:
+            for entry in packages.find_all("a"):
+                package = entry.get_text()
+                versions = pypi_versions(package)
 
-            if description.contents:
-                description = description.contents[0]
-            else:
-                description = ""
-            package, version = package.a["href"].split("/")[2:]
-            data["index"][(package, version)] = description
-            pkg_uries.append({"uri": self.repo_uri + "pypi/" + package + "/" + version,
-                              "parser": self.parse_package_page,
-                              "output": package + "-" + version,
-                              "timeout": 2})
-            entry.decompose()
-
-        packages.decompose()
+                for version in versions:
+                    description = ""
+                    data["index"][(package, version)] = description
+                    pkg_job = {"uri": self.repo_uri + "pypi/" + package + "/" + version,
+                                    "parser": "parse_package_page",
+                                    "output": package + "-" + version,
+                                    "timeout": 2}
+                    task_queue.put(pkg_job)
+                    entry.decompose()
+            packages.decompose
+        elif packages is None:
+            print("Error: I have returned no packages??")
         soup.decompose()
-
         pkg_uries = self.decode_download_uries(pkg_uries)
-        if self.count:
-            pkg_uries = pkg_uries[:self.count]
-        for uri in pkg_uries:
-            attempts = 0
-            while True:
-                try:
-                    attempts += 1
-                    self.process_uri(uri, data)
-                except DownloadingError as error:
-                    print(str(error))
-                    time.sleep(5)
-                    if attempts < 100:
-                        continue
-                break
 
+
+
+        task_queue.join()
+        if self.first is True:
+            time.sleep(5)
+            self.first = False
+            data.update()
+        while result_queue.empty() is not True:
+            time.sleep(1)
+            print("Emptying Queue: estimated queue length left {}".format(str(result_queue.qsize())))
+            data.update(result_queue.get())
+            if self.first is True:
+                print(data)
+        print(data)
         return data
 
-    def parse_package_page(self, data_f):
+
+    @staticmethod
+    def parse_package_page(data_f):
         """
         Parse package page.
         """
-        soup = bs4.BeautifulSoup(data_f.read())
+        soup = bs4.BeautifulSoup(data_f.read(), "lxml")
         data = {}
         data["files"] = []
         data["info"] = {}
